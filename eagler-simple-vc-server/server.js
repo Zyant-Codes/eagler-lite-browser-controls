@@ -2,16 +2,20 @@ import { createServer } from 'node:http';
 import { randomUUID } from 'node:crypto';
 import { WebSocketServer, WebSocket } from 'ws';
 
-const MAX_MESSAGE_BYTES = 32 * 1024;
+const MAX_TEXT_BYTES = 8 * 1024;
+const MAX_AUDIO_BYTES = 8 * 1024;
+const MAX_AUDIO_BYTES_PER_SECOND = 128 * 1024;
 const MAX_ROOM_PEERS = 16;
 const ROOM_PATTERN = /^[A-Za-z0-9_-]{1,32}$/;
 const NAME_PATTERN = /^[^<>\r\n]{1,24}$/;
+const OUTBOUND_AUDIO = 0x01;
+const INBOUND_AUDIO = 0x41;
 
 function parseCsv(value) {
   return (value || '').split(',').map((part) => part.trim()).filter(Boolean);
 }
 
-function send(socket, message) {
+function sendJson(socket, message) {
   if (socket.readyState === WebSocket.OPEN) socket.send(JSON.stringify(message));
 }
 
@@ -21,23 +25,25 @@ function rejectUpgrade(socket, statusCode, message) {
 }
 
 function safeJson(raw) {
-  if (typeof raw !== 'string' || Buffer.byteLength(raw, 'utf8') > MAX_MESSAGE_BYTES) return null;
+  if (typeof raw !== 'string' || Buffer.byteLength(raw, 'utf8') > MAX_TEXT_BYTES) return null;
   try { return JSON.parse(raw); } catch (_) { return null; }
 }
 
 function normalizeJoin(message) {
-  if (!message || message.type !== 'join' || message.protocol !== 'eagler-simple-vc/1') return null;
+  if (!message || message.type !== 'join' || message.protocol !== 'eagler-simple-vc-wss-relay/1') return null;
   const room = typeof message.room === 'string' ? message.room : '';
   const name = typeof message.name === 'string' ? message.name.trim() : '';
-  if (!ROOM_PATTERN.test(room) || !NAME_PATTERN.test(name)) return null;
-  return { room, name };
+  const sampleRate = Number(message.sampleRate);
+  if (!ROOM_PATTERN.test(room) || !NAME_PATTERN.test(name) || !Number.isInteger(sampleRate) || sampleRate < 8000 || sampleRate > 96000) return null;
+  return { room, name, sampleRate };
 }
 
 /**
- * Creates an authenticated WebRTC signaling service for standalone Eagler Simple VC.
- * It routes only signaling metadata; browser-to-browser WebRTC carries the audio.
+ * Creates a standalone WSS voice relay. The server receives one WebSocket from
+ * each client and forwards bounded PCM frames only to authenticated peers in
+ * the same room. There is no WebRTC, ICE exchange, or direct peer connection.
  */
-export function createVoiceService({ tokens, allowedOrigins, iceServers = [], logger = console, maxRoomPeers = MAX_ROOM_PEERS } = {}) {
+export function createVoiceService({ tokens, allowedOrigins, logger = console, maxRoomPeers = MAX_ROOM_PEERS } = {}) {
   if (!tokens || tokens.size === 0) throw new Error('At least one EAGLER_SVC token is required.');
   if (!allowedOrigins || allowedOrigins.size === 0) throw new Error('At least one allowed Origin is required.');
 
@@ -45,14 +51,14 @@ export function createVoiceService({ tokens, allowedOrigins, iceServers = [], lo
   const httpServer = createServer((request, response) => {
     if (request.url === '/healthz') {
       response.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' });
-      response.end(JSON.stringify({ ok: true, service: 'eagler-simple-vc', rooms: rooms.size }));
+      response.end(JSON.stringify({ ok: true, service: 'eagler-simple-vc-wss-relay', rooms: rooms.size }));
       return;
     }
     response.writeHead(404, { 'content-type': 'text/plain' });
     response.end('Not found');
   });
 
-  const wss = new WebSocketServer({ noServer: true, maxPayload: MAX_MESSAGE_BYTES, perMessageDeflate: false });
+  const wss = new WebSocketServer({ noServer: true, maxPayload: MAX_AUDIO_BYTES, perMessageDeflate: false });
   httpServer.on('upgrade', (request, socket, head) => {
     const host = request.headers.host || 'localhost';
     let url;
@@ -69,40 +75,69 @@ export function createVoiceService({ tokens, allowedOrigins, iceServers = [], lo
     const peers = rooms.get(client.room);
     if (peers) {
       peers.delete(client.id);
-      for (const peer of peers.values()) send(peer.socket, { type: 'peer-left', id: client.id });
       if (peers.size === 0) rooms.delete(client.room);
     }
     client.room = null;
   }
 
+  function relayAudio(client, raw) {
+    if (!client.room) { client.socket.close(1008, 'Join a room first'); return; }
+    const input = Buffer.from(raw);
+    if (input.length < 3 || input.length > MAX_AUDIO_BYTES || input[0] !== OUTBOUND_AUDIO || (input.length - 1) % 2 !== 0) {
+      client.socket.close(1003, 'Invalid audio frame');
+      return;
+    }
+    const now = Date.now();
+    if (now - client.rateWindowStart >= 1000) {
+      client.rateWindowStart = now;
+      client.rateBytes = 0;
+    }
+    client.rateBytes += input.length;
+    if (client.rateBytes > MAX_AUDIO_BYTES_PER_SECOND) {
+      client.socket.close(1008, 'Audio rate limit exceeded');
+      return;
+    }
+
+    const output = Buffer.allocUnsafe(9 + input.length - 1);
+    output[0] = INBOUND_AUDIO;
+    output.writeUInt32BE(client.numericId, 1);
+    output.writeUInt32BE(client.sampleRate, 5);
+    input.copy(output, 9, 1);
+    for (const peer of rooms.get(client.room)?.values() || []) {
+      if (peer.id !== client.id && peer.socket.readyState === WebSocket.OPEN) peer.socket.send(output, { binary: true });
+    }
+  }
+
+  let nextNumericId = 1;
   wss.on('connection', (socket) => {
-    const client = { id: randomUUID(), room: null, name: null, socket };
+    const client = {
+      id: randomUUID(),
+      numericId: nextNumericId++,
+      room: null,
+      name: null,
+      sampleRate: null,
+      socket,
+      rateWindowStart: Date.now(),
+      rateBytes: 0
+    };
+    if (nextNumericId > 0xFFFFFFFF) nextNumericId = 1;
 
     socket.on('message', (raw, isBinary) => {
-      if (isBinary) { socket.close(1003, 'Text signaling only'); return; }
+      if (isBinary) { relayAudio(client, raw); return; }
       const message = safeJson(raw.toString());
-      if (!message) { send(socket, { type: 'error', message: 'Invalid or oversized signaling message' }); return; }
+      if (!message) { sendJson(socket, { type: 'error', message: 'Invalid or oversized control message' }); return; }
 
       if (!client.room) {
         const join = normalizeJoin(message);
-        if (!join) { send(socket, { type: 'error', message: 'Send a valid join message first' }); return; }
+        if (!join) { sendJson(socket, { type: 'error', message: 'Send a valid join message first' }); return; }
         const room = rooms.get(join.room) || new Map();
-        if (room.size >= maxRoomPeers) { send(socket, { type: 'error', message: 'Voice room is full' }); socket.close(1008, 'Room full'); return; }
-        const existingPeers = [...room.values()].map((peer) => ({ id: peer.id, name: peer.name }));
+        if (room.size >= maxRoomPeers) { sendJson(socket, { type: 'error', message: 'Voice room is full' }); socket.close(1008, 'Room full'); return; }
         client.room = join.room;
         client.name = join.name;
+        client.sampleRate = join.sampleRate;
         room.set(client.id, client);
         rooms.set(client.room, room);
-        send(socket, { type: 'welcome', id: client.id, room: client.room, peers: existingPeers, iceServers });
-        for (const peer of room.values()) {
-          if (peer.id !== client.id) send(peer.socket, { type: 'peer-joined', id: client.id, name: client.name });
-        }
-        return;
-      }
-
-      if (message.type === 'signal' && typeof message.to === 'string' && message.data && typeof message.data === 'object') {
-        const recipient = rooms.get(client.room)?.get(message.to);
-        if (recipient) send(recipient.socket, { type: 'signal', from: client.id, data: message.data });
+        sendJson(socket, { type: 'welcome', id: client.numericId, room: client.room, relay: true });
         return;
       }
 
@@ -111,8 +146,7 @@ export function createVoiceService({ tokens, allowedOrigins, iceServers = [], lo
         socket.close(1000, 'Client left');
         return;
       }
-
-      send(socket, { type: 'error', message: 'Unsupported signaling message' });
+      sendJson(socket, { type: 'error', message: 'Unsupported control message' });
     });
 
     socket.on('close', () => leave(client));
@@ -141,13 +175,6 @@ export function createVoiceService({ tokens, allowedOrigins, iceServers = [], lo
   };
 }
 
-function parseIceServers(value) {
-  if (!value) return [];
-  const parsed = JSON.parse(value);
-  if (!Array.isArray(parsed)) throw new Error('EAGLER_SVC_ICE_SERVERS_JSON must be a JSON array.');
-  return parsed;
-}
-
 function startFromEnvironment() {
   const devMode = process.env.EAGLER_SVC_DEV_MODE === 'true';
   const tokens = new Set(parseCsv(process.env.EAGLER_SVC_TOKENS));
@@ -156,20 +183,14 @@ function startFromEnvironment() {
     if (tokens.size === 0) tokens.add('change-me-before-production');
     if (origins.size === 0) origins.add('null');
   }
-  let iceServers;
-  try { iceServers = parseIceServers(process.env.EAGLER_SVC_ICE_SERVERS_JSON); } catch (error) {
-    console.error('Invalid ICE configuration:', error.message);
-    process.exitCode = 1;
-    return;
-  }
-  const service = createVoiceService({ tokens, allowedOrigins: origins, iceServers });
+  const service = createVoiceService({ tokens, allowedOrigins: origins });
   const port = Number(process.env.PORT || 8787);
   const host = process.env.HOST || '127.0.0.1';
   service.listen(port, host).then((address) => {
-    console.log(`Eagler Simple VC signaling service listening on ${address.address}:${address.port}`);
+    console.log(`Eagler Simple VC WSS relay listening on ${address.address}:${address.port}`);
     if (devMode) console.warn('Development mode is active. Configure HTTPS/WSS, fixed allowed origins, and strong tokens before production.');
   }).catch((error) => {
-    console.error('Could not start Eagler Simple VC signaling service:', error.message);
+    console.error('Could not start Eagler Simple VC relay:', error.message);
     process.exitCode = 1;
   });
 }
