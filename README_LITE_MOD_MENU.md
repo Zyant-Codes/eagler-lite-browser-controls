@@ -10,6 +10,7 @@
 |---|---|---|
 | Custom Crosshair | Displays a compact browser crosshair at the center of the screen | Static DOM element; no loop |
 | Keystrokes | Shows W, A, S, D, and Space state | Changes only on keyboard down/up events |
+| Armor HUD tracker | Shows four compact armor slots on the chosen left or right side, using values entered in the menu | Static DOM element; changes only on direct manual input |
 | Fullscreen | Requests normal browser fullscreen | Runs only when clicked |
 | Accent / scale / placement | Lets the user set the accent color, menu scale, position, and native resize corner | Updates only on direct user input |
 | Copy Settings | Copies the menu configuration for backup or sharing | Runs only when clicked |
@@ -18,9 +19,11 @@ The menu remembers its own cosmetic settings locally. Press **Right Shift** agai
 
 ## Game-data boundary
 
-The menu deliberately does **not** claim to add a working armor durability HUD or total XP amount. The supplied compiled WASM-GC client exposes no supported browser-level player, inventory, armor, durability, or experience API. An outer-page overlay could only show invented values, so no fake armor or XP display is included.
+The menu now includes a configurable **manual armor tracker**. Enable it in the Right Shift menu, choose the left or right side and scale, then enter the values you want it to display for helmet, chestplate, leggings, and boots. It keeps its layout and entries locally.
 
-The game’s normal experience bar and level number remain rendered by the native runtime. A real armor/XP HUD would require a moddable client build that exposes live game data.
+> The tracker does **not** read equipped gear, armor durability, or total XP automatically. The supplied compiled WASM-GC client exposes no supported browser-level player, inventory, armor, durability, or experience API. The values are manual and clearly labeled as such; no live data is fabricated.
+
+The game’s normal experience bar and level number remain rendered by the native runtime. A real automatic armor/XP HUD would require a moddable client build that exposes live game data.
 
 ## Low-lag defaults
 
